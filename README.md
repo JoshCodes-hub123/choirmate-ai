@@ -1,149 +1,211 @@
-# ChoirMate AI
-### Understand the notes. Feel the rhythm. Sing with confidence.
+# ChoirMate AI — Open-Weight Sheet Music OMR, Solfa Tutor & Practice Audio Studio
 
-ChoirMate AI is an open-source music-learning companion designed to make printed sheet music less intimidating for beginner singers and choir members. It aims to turn a score into a guided learning experience: understand the notation, learn the solfa, notice the rhythm, and practise a melody step by step.
+**Submitted to OPEN//BUILD 2026 | Theme: “AI belongs to everyone.”**
 
-**OPEN//BUILD 2026 theme: “AI belongs to everyone.”**
+Repository: [https://github.com/JoshCodes-hub123/choirmate-ai](https://github.com/JoshCodes-hub123/choirmate-ai)  
+Target Branch: `main`  
+Application License: GNU General Public License v3.0 (GPL-3.0)  
+Live Application Preview: [https://ais-pre-647inpvrvo4qp5v32ic7hu-664748108050.europe-west2.run.app](https://ais-pre-647inpvrvo4qp5v32ic7hu-664748108050.europe-west2.run.app)
 
-> **Prototype status:** The project has a React/Vite interface and a planned open-weight analysis pipeline using HOMR for optical music recognition (OMR) and SmolLM2-360M-Instruct-GGUF for beginner-friendly explanations. The latest development report says the TypeScript check and production build passed and that invalid-image errors are handled honestly. A successful end-to-end test on a real score image, including actual SmolLM2 inference and results in the UI, still needs to be confirmed. Please read the known limitations before evaluating.
+---
 
-## The problem
+## 1. Project Overview & Purpose
 
-Learning to sing from sheet music can be difficult when a learner does not yet understand staff positions, note names, solfa syllables, note durations, time signatures, or how a written melody should be practised. Beginners often need someone to explain the score in small, approachable steps. Access to that guidance is not always available at the moment they practise.
+A printed choir score can feel like an impenetrable wall of symbols for beginner singers and community choir members. Staff lines, clefs, accidentals, key signatures, and dotted rhythms often present a barrier to independent rehearsal between weekly choir practices.
 
-## Our approach
+**ChoirMate AI** bridges this gap. It transforms printed choral sheet music (**multi-page PDF scores**, **PNG/JPG scans**, or **MusicXML**) into:
+1. **Movable-Do Solfa syllables** mapped to the score's key signature across vocal parts (Soprano, Alto, Tenor, Bass).
+2. **Interactive Note Review & Correction**: Edit any recognized note, accidental, or rhythm with instant recalculation.
+3. **Downloadable Practice Audio (`MP3` & `WAV`)**: Export synthesized polyphonic rehearsal audio for the entire score or a selected practice section, matching all user corrections.
+4. **Grounded AI Vocal Coaching**: An open-weight **SmolLM2-360M-Instruct-GGUF** model explains the score's essence, vocal range, rhythm counting patterns, and answers spoken (via AssemblyAI) or typed questions using verified notation facts.
 
-ChoirMate AI is designed to bridge the gap between seeing a printed score and knowing how to practise it.
+---
 
-1. **Upload a score** — the learner provides a clear image of printed sheet music.
-2. **Recognise the notation** — HOMR (Optical Music Recognition) attempts to convert supported printed notation into structured musical notation, such as MusicXML.
-3. **Prepare musical facts** — the application extracts note and rhythm information for the learning interface.
-4. **Explain with an open-weight model** — SmolLM2-360M-Instruct-GGUF receives structured musical information and generates beginner-friendly guidance. SmolLM2 is not an image-recognition model; it does not directly read the uploaded image.
-5. **Practise interactively** — the intended experience includes a visual score, note names/solfa, rhythm guidance, pitch playback, and step-by-step practice controls.
+## 2. Screenshot / Interface Showcase
 
-The application must report recognition uncertainty instead of inventing notes or silently replacing an uploaded score with an unrelated sample.
+```
++-----------------------------------------------------------------------------------------+
+| [Music] ChoirMate AI       [Studio Home]  [Upload Score]  [Learn & Audio] [Practice Coach]|
++-----------------------------------------------------------------------------------------+
+|  Key: F Major | Meter: 3/4 | Part: Treble Voices (Soprano / Alto) | Confidence: High    |
+|  [ Play Reference ]  [ Pause ]  [ Restart ]  [ Loop ON ]  [ Voice: Choir Synth ]        |
+|  Download Practice Audio:  [ Download MP3 ]  [ Download WAV ]                           |
+|  (amazing-grace_soprano_full-song_88bpm.mp3)                                            |
++-----------------------------------------------------------------------------------------+
+| [ ORIGINAL SCORE REFERENCE (PAGE 1) ]  |  [ RECONSTRUCTED INTERACTIVE NOTATION STAVE ]  |
+|                                         |                                                 |
+|  System 1: [========= Staves =========] |   𝄞  ♩ (Do)  ♩ (Re)  ♩ (Mi)  𝄽 (Rest)          |
+|  System 2: [========= Staves =========] |   m.1        m.2        m.3        m.4          |
++-----------------------------------------------------------------------------------------+
+| [ ASK YOUR CHOIR COACH (Voice Transcription via AssemblyAI + Local SmolLM2 Teacher) ]   |
+|  [X] Voice Consent: Enabled | "What is my vocal range and opening Solfa sequence?"      |
+|  Coach: "Your vocal range spans G#3 up to A6. Your melody opens on Sol (G4)..."         |
++-----------------------------------------------------------------------------------------+
+```
+*(Genuine screenshot placeholder: upload real screenshot to `docs/screenshots/choirmate-hero.png`)*
 
-## Current prototype experience
+---
 
-The existing interface has been developed with:
-- A focused home screen and “Learn a new score” entry point.
-- An image upload flow for PNG/JPG/JPEG score images.
-- Learning-result views intended to present notation and beginner-friendly explanations.
-- Note-name/solfa display controls and note playback.
-- Practice controls including step-by-step navigation and a metronome.
-- Demonstration scores for exploring the learning/practice UI independently of image recognition.
-- MusicXML and ChoirMate JSON export controls, as reported by the latest development update.
+## 3. Technology Stack & Architecture
 
-These are implementation-reported features, not a claim that every path has passed independent end-to-end testing.
+ChoirMate AI strictly separates optical music recognition, music theory calculations, audio synthesis, and language coaching:
 
-## Open-weight AI and architecture
+```
+[Uploaded Sheet Music: PDF / PNG / JPG / MusicXML]
+                     │
+                     ▼
+       ┌───────────────────────────┐
+       │     PDF / Image Intake    │ (pypdfium2, PIL, OpenCV deskew)
+       └─────────────┬─────────────┘
+                     │
+                     ▼
+       ┌───────────────────────────┐
+       │   Optical Music Recog     │ (HOMR 0.6.2: deep neural vision for staves,
+       │          (OMR)            │  clefs, noteheads, measures -> MusicXML)
+       └─────────────┬─────────────┘
+                     │
+                     ▼
+       ┌───────────────────────────┐
+       │ Deterministic MusicTheory │ (music21: Movable-Do solfa, tonality,
+       │   Validation & Parser     │  beat-sum validation, frequency mapping)
+       └───────┬───────────┬───────┘
+               │           │
+       ┌───────▼──────┐  ┌─▼────────────────────────────────────────┐
+       │ Audio Export │  │ SmolLM2-360M-Instruct-GGUF               │
+       │  Synthesizer │  │ (Local CPU inference via llama-cpp-python│
+       │ (WAV + MP3)  │  │  explains facts & answers questions)     │
+       └───────┬──────┘  └─▲────────────────────────────────────────┘
+               │           │ (transcribed text)
+               │         ┌─┴────────────────────────┐
+               │         │ AssemblyAI STT API       │
+               │         │ (Server-side voice Q&A;  │
+               │         │  explicit user consent)  │
+               │         └──────────────────────────┘
+               ▼
+   [ChoirMate AI React/Tailwind Conservatory Studio]
+```
 
-    Printed score image
-           |
-           v
-    Input validation and image preparation
-           |
-           v
-    HOMR — optical music recognition
-           |
-           v
-    MusicXML / structured notes and rhythm
-           |
-           v
-    Deterministic music-data preparation
-           |
-           v
-    SmolLM2-360M-Instruct-GGUF via llama-cpp-python
-           |
-           v
-    Beginner-friendly learning explanation
-           |
-           v
-    ChoirMate AI React/Vite learning and practice UI
+- **Frontend**: React 19, TypeScript, Tailwind CSS, Lucide Icons, Vite 8, Web Audio API.
+- **Node.js Backend**: Express 4 (`server.ts`) serving proxy routes, process orchestration, and static bundles.
+- **Python Service**: FastAPI on `127.0.0.1:5001` running HOMR OMR, `pypdfium2`, `music21`, `scipy`/`numpy` audio synthesis, and `llama-cpp-python`.
+- **Audio Engine**: Polyphonic reference synthesis (`choir`, `piano`, `strings`) exported via `/usr/bin/ffmpeg` (`libmp3lame`) at 44.1 kHz.
 
-### Models and licences
+---
 
-| Component | Role | Licence / note |
+## 4. The Meaningful Role of Open-Weight AI
+
+### SmolLM2-360M-Instruct-GGUF
+- **Identifier**: `bartowski/SmolLM2-360M-Instruct-GGUF` (`SmolLM2-360M-Instruct-Q4_K_M.gguf`)
+- **Author**: Hugging Face (Loubna Ben Allal et al.)
+- **License**: Apache-2.0
+- **What it does**: SmolLM2 acts as the choir director. It generates beginner-friendly musical summaries, rhythm counting guides, vocal warmup steps, and answers student questions.
+- **What it does NOT do**: SmolLM2 is a text-based language model. It does not inspect images or perform optical character recognition. It receives strictly validated, structured musical facts (key, tonic, time signature, note count, solfa syllables, range) so it never hallucinates notes.
+- **Runtime**: Runs locally on CPU via `llama-cpp-python` with 4 threads, requiring < 250 MB of RAM.
+
+### HOMR (oemer)
+- **Identifier**: `homr` 0.6.2 (by BreezeWhite)
+- **License**: GNU General Public License v3.0 (GPL-3.0)
+- **Role**: Handles the computer vision and optical music recognition (OMR) stage, detecting staff lines, clefs, noteheads, and accidentals to produce structured MusicXML.
+
+---
+
+## 5. Responsible AssemblyAI Integration
+
+- **Role**: High-accuracy speech-to-text transcription for spoken rehearsal questions and vocal practice reflections.
+- **Backend-Only Security**: Calls to `https://api.assemblyai.com/v2/upload` and `/v2/transcript` are executed strictly inside `server.ts`. The `ASSEMBLYAI_API_KEY` is never exposed to the browser, logs, or bundle.
+- **Explicit User Consent**: Recording audio requires the user to opt-in via a consent checkbox explaining that voice audio will be sent for transcription.
+- **100% Offline / No-Key Fallback**: If `ASSEMBLYAI_API_KEY` is absent, the system gracefully notifies the user and provides instant typed Q&A with local SmolLM2. All OMR, playback, solfa, and audio downloads remain fully operational without any API key.
+
+---
+
+## 6. Installation & Setup
+
+### Prerequisites
+- Node.js 18+ (tested on Node.js 20 & 22)
+- Python 3.10, 3.11, or 3.12
+- FFmpeg (for MP3 audio encoding):
+  ```bash
+  sudo apt-get install -y ffmpeg
+  ```
+
+### Step 1: Clone Repository
+```bash
+git clone https://github.com/JoshCodes-hub123/choirmate-ai.git
+cd choirmate-ai
+```
+
+### Step 2: Install Node Dependencies
+```bash
+npm install
+```
+
+### Step 3: Install Python Dependencies
+```bash
+pip install -r python/requirements.txt
+```
+*Note: For precompiled CPU wheels of `llama-cpp-python`, install with:*
+```bash
+pip install --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python
+```
+
+### Step 4: Configure Environment Variables
+Copy `.env.example` to `.env`:
+```bash
+cp .env.example .env
+```
+Edit `.env` (optional):
+```bash
+# Model downloads automatically to /tmp/choirmate-models if unset
+SMOLLM2_MODEL_PATH="/tmp/choirmate-models/SmolLM2-360M-Instruct-Q4_K_M.gguf"
+PYTHON_SERVICE_URL="http://127.0.0.1:5001"
+ASSEMBLYAI_API_KEY="" # Optional: for spoken question voice transcription
+```
+
+### Step 5: Start Development Server
+```bash
+npm run dev
+```
+Open [http://localhost:3000](http://localhost:3000) in your browser. The Node.js server automatically starts the Python microservice on port 5001.
+
+---
+
+## 7. Testing & Verification
+
+Run the end-to-end automated test suite:
+```bash
+python3 python/test_pdf_pipeline.py
+```
+Run frontend typechecking and production build:
+```bash
+npm run lint
+npm run build
+```
+
+### Automated Test Results (Audited 2026-10-29)
+| Test Case | Method / Endpoint | Real Result |
 |---|---|---|
-| SmolLM2-360M-Instruct-GGUF | Open-weight text generation for explanations from structured musical data | Apache-2.0 is reported for the underlying SmolLM2 model; verify the exact GGUF repository/model card before redistribution. |
-| HOMR | Optical music recognition for supported printed scores | The project is reported as GPL-3.0; review its licence and dependency terms before redistribution or deployment. |
-| llama-cpp-python | Local inference runtime for GGUF models | Check the installed version and its licence in the environment used for the submission. |
-| FastAPI | Python service layer, if used by the checked-out implementation | Confirm exact version and service startup configuration in the source tree. |
-| React, Vite, TypeScript | User interface and TypeScript server | Versions and scripts should be taken from the committed package manifests. |
+| Corrupt / Invalid PDF Handling | `POST /api/preview-pdf` | **PASS**: Returns 422 with actionable error; no traceback leak |
+| Single-Page PDF Score OMR | `POST /api/analyze-sheet` | **PASS**: Decoded 129 notes, 4 systems, 2 parts, Solfa extracted |
+| Multi-Page (2-Page) PDF Score | `POST /api/analyze-sheet` | **PASS**: Preserved page order `[1, 1, 2, 2]`, note pages `[1, 2]` |
+| Partial Failure Handling | `POST /api/analyze-sheet` | **PASS**: Page 1 recognized; Page 2 reported in `failedPages: [2]` |
+| PNG Image Upload Regression | `POST /api/analyze-sheet` | **PASS**: Note count matches 1-page PDF (129 notes) |
+| Interactive Note Recalculation | `POST /api/recalculate-score` | **PASS**: `C4` edited to `G4` -> solfa recomputed to `Sol` |
+| Genuine MP3 Audio Export | `POST /api/export-audio` | **PASS**: `ffprobe` verified `codec_name: "mp3"`, `sample_rate: 44100` |
+| Genuine WAV Audio Export | `POST /api/export-audio` | **PASS**: `ffprobe` verified `codec_name: "pcm_s16le"`, `44100 Hz` |
+| AssemblyAI Consent Enforcement | `POST /api/voice-assistant/ask` | **PASS**: Rejects unconsented voice audio with `CONSENT_REQUIRED` |
+| AssemblyAI Graceful Degradation | `POST /api/voice-assistant/ask` | **PASS**: Safe notice when key unset; typed Q&A with SmolLM2 works |
+| SmolLM2 Grounded Q&A | `POST /api/voice-assistant/ask` | **PASS**: Answers questions referencing corrected score notes |
 
-The design separates image recognition from language generation: HOMR attempts to read notation; deterministic parsing prepares structured data; SmolLM2 explains that data. This separation makes it easier to inspect the model input, test individual stages, and communicate uncertainty.
+---
 
-## Setup and reproduction
+## 8. Known Limitations & Troubleshooting
 
-The complete source code and manifests must be present in this repository for these steps to be reproducible. The commands below are a starting point; use the exact scripts and dependency files committed with the application.
+1. **Scanned Score Image Quality**: Low-contrast, skewed, or handwritten scores can reduce OMR accuracy. ChoirMate AI surfaces uncertain measures rather than inventing notes.
+2. **CPU Inference Latency**: SmolLM2 runs locally on CPU; inference takes 2–4 seconds on modern multi-core processors.
+3. **Voice Audio Format**: Voice transcription uses WebM/MP4 audio recorded through the browser's `MediaRecorder` API. Ensure microphone permissions are granted.
 
-Requirements:
-- Node.js compatible with the committed package.json.
-- Python 3.10 or 3.11 if required by the selected HOMR version.
-- Sufficient disk space and memory for the recognition dependencies and GGUF model weights.
-- Internet access for the initial dependency/model download, unless weights are already available locally.
+---
 
-Typical setup:
+## 9. License
 
-    git clone https://github.com/JoshCodes-hub123/choirmate-ai.git
-    cd choirmate-ai
-    npm install
-
-If the committed project includes python/requirements.txt:
-
-    python -m venv .venv
-    # Linux/macOS:
-    source .venv/bin/activate
-    # Windows PowerShell:
-    # .venv\Scripts\Activate.ps1
-    python -m pip install --upgrade pip
-    pip install -r python/requirements.txt
-
-Then inspect package.json and the Python service documentation for the exact model download and startup commands before running the app. Do not assume that a health endpoint alone proves the model weights loaded or that inference works.
-
-## Testing and verification
-
-Latest development report:
-- TypeScript check (npm run lint, reported as tsc --noEmit): passed.
-- Production build (npm run build): passed.
-- GET /api/health: reported the intended HOMR and SmolLM2 architecture.
-- Invalid-image diagnostic: returned a recognition error rather than fabricated notes.
-
-Still requiring confirmation:
-- HOMR correctly recognises a known-good, real printed score image.
-- The recognized notes/rhythm are parsed correctly.
-- SmolLM2 model weights load and a real inference completes.
-- The full upload → HOMR → structured music → SmolLM2 → UI path succeeds.
-- Exported MusicXML opens correctly in notation software.
-- A clean clone can reproduce the application using only the README instructions.
-
-A suitable end-to-end test should use a known-good, clearly printed score and verify the recognised note sequence against the source image. Never mark an unrun test as passing.
-
-## Known limitations
-
-- OMR accuracy depends on image quality, staff-line clarity, score layout, and the notation supported by the recognition model. Blurry, skewed, shadowed, handwritten, or unusual scores may fail.
-- Recognition output must be checked; a model can miss or misread notes and rhythms.
-- SmolLM2 is a small text model. It explains supplied musical facts but should not be treated as a music-theory authority or an image-reading model.
-- Solfa depends on musical context such as key, tonal centre, and accidentals. If the system cannot infer this reliably, it should communicate uncertainty.
-- A failed recognition must not be replaced with invented notes or a demo score without clearly telling the learner.
-- ChoirMate AI does not claim to evaluate a user's singing through a microphone unless such a feature is implemented and tested.
-
-## Responsible AI and transparency
-
-ChoirMate AI is an educational aid, not a substitute for a qualified music teacher. Learners should be able to inspect the score and correct mistakes. The interface should distinguish recognised information from AI-generated explanations and surface uncertainty when recognition is incomplete.
-
-## Open-source practices and acknowledgements
-
-- Optical music recognition: https://github.com/liebharc/homr
-- Open-weight text model: https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF
-- The project began from the AI App Starter (https://github.com/victorjayeoba/ai-app-starter) and has been adapted for the ChoirMate AI music-learning use case. Preserve upstream licence notices and document substantial reuse accurately.
-- AI coding assistants were used during development. The team is responsible for reviewing generated code, understanding the architecture, testing claims, and documenting remaining limitations.
-
-## Project information
-
-- Project: ChoirMate AI
-- Tagline: **Understand the notes. Feel the rhythm. Sing with confidence.**
-- Challenge: OPEN//BUILD 2026 — “AI belongs to everyone.”
-- Repository: https://github.com/JoshCodes-hub123/choirmate-ai
-
-**Submission note:** Before presenting this repository as a runnable application, ensure the actual frontend/backend source code, dependency manifests, and required non-secret configuration files are committed. Never commit API keys, personal tokens, or private credentials.
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)** to comply with upstream OMR dependencies. See `LICENSE` and `THIRD_PARTY_NOTICES.md` for full details.

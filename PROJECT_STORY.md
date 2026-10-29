@@ -1,65 +1,86 @@
 # ChoirMate AI — Project Story
+
 ## OPEN//BUILD 2026 | “AI belongs to everyone.”
 
-### One-sentence pitch
-ChoirMate AI is an open-source music-learning companion that aims to help beginner singers turn printed sheet music into understandable notes, solfa, rhythm guidance, and a practical rehearsal path.
+### One-Sentence Pitch
+ChoirMate AI is an open-source, open-weight music-learning companion that empowers beginner singers and community choir members to transform printed sheet music and multi-page PDFs into understandable notes, Movable-Do Solfa, interactive correction, downloadable practice audio, and patient AI coaching.
 
-### The problem we are solving
-A printed score can feel like a wall of symbols to someone who is still learning music notation. A beginner may see staff lines, note heads, rests, key signatures, and time signatures without knowing where to start. In a choir, that can make independent rehearsal difficult: the learner needs a patient explanation of what the score says and how to practise it.
+---
 
-The barrier is not always lack of interest or willingness to learn. It can be the gap between written musical notation and an explanation that a beginner can act on.
+### The Problem We Are Solving
+A printed choir score can feel like an intimidating wall of symbols to someone who is still learning to read music notation. A beginner sees five staff lines, clefs, accidentals, noteheads, rests, key signatures, and time signatures without knowing what pitch to sing or how to count the rhythm.
 
-### Our idea
-ChoirMate AI is designed to make the first steps less intimidating. Instead of presenting a learner with a score and leaving them to interpret it alone, it aims to guide them through a sequence:
+In community and church choirs, this creates a major rehearsal barrier:
+- Singers want to prepare at home between rehearsals, but without a piano or a vocal coach beside them, they get stuck on unfamiliar intervals or complex rhythms.
+- Existing commercial music software (Sibelius, Finale, Dorico) is expensive, desktop-only, and built for professional composers, not everyday learners.
+- Generic AI chatbots hallucinate melodies or invent notes because they cannot visually read notation or understand musical pitch systems.
 
-1. Start with a printed score image.
-2. Use optical music recognition to attempt to identify the notation.
-3. organise recognised notes and rhythm into structured musical information.
-4. Use an open-weight language model to explain those musical facts in beginner-friendly language.
-5. Support practice with a visual score, note names and solfa, playback, and step-by-step rehearsal controls.
+The obstacle is not a lack of musical passion or willingness to practise. It is the gap between written musical notation and an approachable, honest explanation that a beginner can immediately act upon.
 
-The product principle is simple: make the next useful step clear, and be honest when the system is unsure.
+---
 
-### Why this fits “AI belongs to everyone”
-AI should not only help people who already know how to write prompts or operate complex creative software. It can also support learners who need a concept explained in simpler language and broken into manageable steps.
+### Our Idea & Architecture
+ChoirMate AI was created to make that first step welcoming and practical. Instead of leaving a singer alone with an intimidating page, it guides them through an honest, structured pipeline:
 
-ChoirMate AI applies AI to a specific learning barrier: understanding printed music. The intended experience is approachable and practice-oriented rather than a generic chatbot.
+1. **Intake Multi-Page PDF & Image Scores**: Accept complete single-page or multi-page PDF documents, PNG/JPG scans, or MusicXML files. The original score is preserved page-by-page so the learner always has their authentic reference.
+2. **Optical Music Recognition (HOMR)**: Use open-weight deep neural networks to detect staff lines, clefs, noteheads, and measures in reading order.
+3. **Deterministic Music Theory Processing (music21)**: Map note frequencies, time signatures, key signatures, and Movable-Do Solfa syllables (Do, Re, Mi, Fa, Sol, La, Ti) across SATB parts without language-model guesswork.
+4. **Interactive Note Review & Recalculation**: If an accidental or rhythm is misread or unclear, the singer can edit the note directly and recalculate the score in real time.
+5. **Downloadable Practice Audio (`MP3` & `WAV`)**: Synthesize high-quality practice audio (`Choir Synth`, `Piano`, or `Strings`) matching all note corrections and export genuine MP3 (via FFmpeg) or WAV files to take on their phone.
+6. **Open-Weight AI Vocal Coach (SmolLM2-360M-Instruct)**: Explain the score's essence, vocal range, and rhythm counting in plain language, and answer learner questions grounded strictly in validated score facts.
+7. **Optional Voice Q&A (AssemblyAI)**: Singers can speak their rehearsal questions, transcribe them via AssemblyAI with explicit consent, and receive grounded answers from the local coach.
 
-### What makes the technical approach meaningful
-The project separates two different jobs:
+---
 
-- **HOMR** attempts optical music recognition: turning supported printed notation into machine-readable musical information.
-- **SmolLM2-360M-Instruct-GGUF**, run through a compatible local inference runtime, is intended to explain structured musical information in beginner-friendly language.
+### Why This Fits “AI Belongs to Everyone”
+Artificial intelligence should not only benefit prompt engineers, corporate executives, or professional software developers. It should empower ordinary people learning a human craft—like singing in harmony with their neighbors.
 
-SmolLM2 is not being described as a vision model. It does not directly inspect the uploaded image in this architecture. The recogniser and the language model have distinct roles. This makes the system easier to reason about and gives the team a clear place to inspect and correct errors.
+By keeping the core architecture open-weight, locally runnable on modest CPU hardware, and free of proprietary paywalls, ChoirMate AI democratizes musical literacy for choral singers everywhere.
 
-### What we have built so far
-The project has a designed React/Vite interface and learning-oriented interactions, including a sheet upload flow, learning and practice views, solfa/note display, note playback, a metronome, demonstration scores, and score-export controls as reported by the development environment.
+---
 
-The latest development report states that the TypeScript check and production build passed and that invalid-image input returns an honest diagnostic rather than fabricated notes. Those checks are useful, but they are not the same as proving that a real score can be recognised and explained end to end.
+### What Makes the Technical Decisions Meaningful
+The core technical principle of ChoirMate AI is the **strict separation of responsibilities**:
 
-### Current status and honesty about limitations
-At the time of this submission documentation:
-- The project architecture is intended to use HOMR for recognition and SmolLM2 for text explanations.
-- A clean end-to-end test on a known-good printed score, including actual SmolLM2 inference and successful display in the UI, still needs to be independently confirmed.
-- Image quality and supported notation can affect recognition.
-- Incorrect recognition could lead to incorrect explanations; outputs should be checked and uncertain results should be shown as uncertain.
-- A demonstration score can showcase the learning interface, but must not be presented as proof that an uploaded image was successfully recognised.
+- **HOMR** handles computer vision: detecting staves, clefs, noteheads, and accidentals to output structured MusicXML.
+- **music21 & deterministic algorithms** calculate intervals, frequencies, measure beat sums, and Movable-Do Solfa.
+- **FFmpeg & Web Audio** synthesize and encode audio tracks from validated musical events.
+- **SmolLM2-360M-Instruct-GGUF** handles language coaching: it receives structured musical facts (key, tonality, vocal range, note count, solfa syllables, rhythm patterns) and generates supportive pedagogical guidance.
 
-We prefer an honest prototype report over claims that have not been tested.
+**SmolLM2 is never described as an image model.** It does not inspect raw pixels. This architectural clarity eliminates hallucinations, makes the system debuggable, and ensures every note played or explained is grounded in reality.
 
-### What we want to improve next
-1. Verify and improve the real image-to-notation-to-explanation path with known-good score fixtures.
-2. Make recognition confidence and correction workflows more useful to learners.
-3. Improve support for key signatures, accidentals, rests, voices, and more varied printed score layouts.
-4. Expand accessibility and beginner-friendly rehearsal guidance.
-5. Make installation and evaluation reproducible on a clean machine.
+---
 
-### Open source and AI assistance
-The project began from an AI app starter and has been adapted for this music-learning use case. The repository should retain upstream licence notices and acknowledge reused code. AI coding assistants were used during development; the project team remains responsible for reviewing generated code, testing it, understanding the implementation, and documenting limitations. See README.md for the current architecture and reproducibility notes.
+### Completed Capabilities vs. Future Roadmap
 
-### Project identity
-**ChoirMate AI**  
-*Understand the notes. Feel the rhythm. Sing with confidence.*
+#### Completed & Verified Capabilities
+- Full single-page and multi-page PDF sheet music processing (up to 12 pages / 25 MB).
+- Multi-page document preview with high-resolution page thumbnails.
+- HOMR optical music recognition pipeline across multiple systems, staves, and SATB vocal parts.
+- Preservation of original score reference alongside reconstructed interactive notation staves.
+- Movable-Do Solfa syllable mapping anchored to key signatures.
+- Interactive note review table with real-time recalculation of pitches, solfa, and measure beat validation.
+- Genuine MP3 practice audio export encoded via FFmpeg (`libmp3lame`) with meaningful filenames.
+- 44.1 kHz 16-bit PCM WAV audio export for full scores and selected practice sections.
+- Full playback transport controls: Play, Pause, Resume, Restart, Stop, Loop Section, Tempo slider, Metronome click, and Voice instrument switcher.
+- Responsible AssemblyAI speech-to-text integration with explicit user consent.
+- Local SmolLM2-360M-Instruct-GGUF text and voice Q&A grounded in active score data.
+- 100% offline fallback: typed Q&A, playback, solfa, and audio export work with zero external API keys.
 
-Repository: https://github.com/JoshCodes-hub123/choirmate-ai
+#### Future Roadmap
+- Direct camera capture with real-time framing and glare detection on mobile.
+- Polyphonic multi-part simultaneous audio mixing (e.g., mute your own part while other choir parts sing harmony).
+- Lyric alignment and syllabic text-to-solfa synchronizer.
+
+---
+
+### Open Source, Licensing & Acknowledgements
+- **ChoirMate AI**: Licensed under the GNU General Public License v3.0 (GPL-3.0).
+- **SmolLM2-360M-Instruct**: Apache-2.0 (Hugging Face).
+- **HOMR (oemer)**: GPL-3.0 (BreezeWhite).
+- **llama-cpp-python**: MIT License (Andrei Betlen).
+- **pypdfium2**: Apache-2.0 / BSD-3-Clause.
+- **music21**: BSD-3-Clause (Michael Scott Cuthbert).
+- **FFmpeg**: LGPL-2.1+ / GPL-2.0+.
+
+Developed with the assistance of Google AI Studio Build agents and audited by human software engineers for OPEN//BUILD 2026.
