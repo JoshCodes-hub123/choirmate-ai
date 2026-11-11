@@ -1,4 +1,5 @@
 import { MusicNote } from '../types/music';
+import { getApiUrl } from './apiConfig';
 
 export type InstrumentVoice = 'choir' | 'piano' | 'strings';
 export type AudioExportFormat = 'mp3' | 'wav';
@@ -20,6 +21,7 @@ export interface ExportAudioParams {
   voice?: InstrumentVoice;
   format: AudioExportFormat;
   metronome?: boolean;
+  previewOnly?: boolean;
 }
 
 export interface ExportAudioResult {
@@ -28,6 +30,7 @@ export interface ExportAudioResult {
   mimeType: string;
   durationSeconds: number;
   byteLength: number;
+  objectUrl?: string;
 }
 
 function sanitizeSlug(text: string, fallback = 'score'): string {
@@ -509,7 +512,7 @@ export async function exportPracticeAudioFile(
   }
 
   try {
-    const response = await fetch('/api/export-audio', {
+    const response = await fetch(getApiUrl('/api/export-audio'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -548,7 +551,10 @@ export async function exportPracticeAudioFile(
       );
 
     const blob = new Blob([bytes], { type: mimeType });
-    triggerBrowserBlobDownload(blob, fileName);
+    const objectUrl = URL.createObjectURL(blob);
+    if (!params.previewOnly) {
+      triggerBrowserBlobDownload(blob, fileName);
+    }
 
     return {
       fileName,
@@ -556,30 +562,11 @@ export async function exportPracticeAudioFile(
       mimeType,
       durationSeconds: json.durationSeconds || 0,
       byteLength: bytes.length,
+      objectUrl,
     };
   } catch (err) {
-    if (params.format === 'wav') {
-      const { blob, durationSeconds } = synthesizeClientWavBlob(
-        params.notes,
-        params.tempo || 88,
-        params.voice || 'choir'
-      );
-      const fileName = buildPracticeAudioFileName(
-        params.title,
-        params.partName,
-        params.scopeLabel,
-        params.tempo,
-        'wav'
-      );
-      triggerBrowserBlobDownload(blob, fileName);
-      return {
-        fileName,
-        format: 'wav',
-        mimeType: 'audio/wav',
-        durationSeconds,
-        byteLength: blob.size,
-      };
-    }
-    throw err;
+    throw err instanceof Error
+      ? err
+      : new Error('Failed to generate practice audio from the Python audio exporter.');
   }
 }

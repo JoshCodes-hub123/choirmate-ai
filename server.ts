@@ -1,19 +1,89 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, spawnSync, ChildProcess } from 'child_process';
 import { SAMPLE_SCORES } from './src/data/sampleScores.ts';
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const rootDir = fs.existsSync(path.join(__dirname, 'package.json'))
+  ? __dirname
+  : path.resolve(__dirname, '..');
+
+for (const envFile of ['.env.windows.local', '.env.local', '.env']) {
+  const fullEnvPath = path.join(rootDir, envFile);
+  if (fs.existsSync(fullEnvPath)) {
+    dotenv.config({ path: fullEnvPath, override: false });
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('[ChoirMate Server] Uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[ChoirMate Server] Unhandled rejection:', reason);
+});
 
 const app = express();
-const PORT = 3000;
-const PYTHON_SERVICE_URL = process.env.PYTHON_SERVICE_URL || 'http://127.0.0.1:5001';
+const PORT = Number(process.env.PORT) || 3000;
+const PYTHON_SERVICE_URL = (
+  process.env.PYTHON_SERVICE_URL ||
+  process.env.PYTHON_BACKEND_URL ||
+  'http://127.0.0.1:5001'
+)
+  .trim()
+  .replace(/\/+$/, '');
+
+const PYTHON_SERVICE_SECRET = (
+  process.env.PYTHON_SERVICE_SECRET ||
+  process.env.CHOIRMATE_BACKEND_SECRET ||
+  ''
+).trim();
+
+function isLocalPythonServiceUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.hostname === '127.0.0.1' ||
+      parsed.hostname === 'localhost' ||
+      parsed.hostname === '0.0.0.0'
+    );
+  } catch {
+    return url.includes('127.0.0.1') || url.includes('localhost');
+  }
+}
+
+const IS_LOCAL_PYTHON_BACKEND = isLocalPythonServiceUrl(PYTHON_SERVICE_URL);
+
+function buildPythonHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'ngrok-skip-browser-warning': 'true',
+    ...(extra || {}),
+  };
+  if (PYTHON_SERVICE_SECRET) {
+    headers['X-ChoirMate-Secret'] = PYTHON_SERVICE_SECRET;
+    headers['Authorization'] = `Bearer ${PYTHON_SERVICE_SECRET}`;
+  }
+  return headers;
+}
+
+const FRIENDLY_HOMR_UNAVAILABLE_MESSAGE =
+  'Sheet music image and PDF recognition is temporarily unavailable because the HOMR Optical Music Recognition engine is currently offline. You can still upload MusicXML (.musicxml or .xml) files for full note analysis, SATB voice extraction, and practice audio generation.';
+
+// Production CORS Middleware for cross-origin Vercel frontend requests
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(express.json({ limit: '40mb' }));
 
@@ -61,82 +131,150 @@ const audioExportCache = new FastLRUCache<any>(50, 45 * 60 * 1000);
 let pythonDaemon: ChildProcess | null = null;
 let isBootstrappingPython = false;
 
-async function checkPythonServiceHealth(): Promise<{ active: boolean; modelLoaded: boolean }> {
+interface PythonHealthInfo {
+  active: boolean;
+  modelLoaded: boolean;
+  omrAvailable: boolean;
+  omrEngineStatus: 'ready' | 'unavailable_in_environment' | 'backend_offline';
+  missingOmrDependencies: string[];
+  pdfSupport: boolean;
+  musicXmlSupport: boolean;
+  voiceStudioAvailable: boolean;
+  audioExportAvailable: boolean;
+}
+
+async function checkPythonServiceHealth(): Promise<PythonHealthInfo> {
   try {
     const pyRes = await fetch(`${PYTHON_SERVICE_URL}/health`, {
-      signal: AbortSignal.timeout(1500),
+      headers: buildPythonHeaders(),
+      signal: AbortSignal.timeout(IS_LOCAL_PYTHON_BACKEND ? 1800 : 4000),
     });
     if (pyRes.ok) {
       const healthData: any = await pyRes.json();
+      const omrAvailable = Boolean(healthData?.omrAvailable ?? healthData?.modelLoaded);
       return {
         active: true,
         modelLoaded: Boolean(healthData?.modelLoaded),
+        omrAvailable,
+        omrEngineStatus: omrAvailable ? 'ready' : 'unavailable_in_environment',
+        missingOmrDependencies: Array.isArray(healthData?.missingOmrDependencies)
+          ? healthData.missingOmrDependencies
+          : [],
+        pdfSupport: Boolean(healthData?.pdfSupport),
+        musicXmlSupport: healthData?.musicXmlSupport !== false,
+        voiceStudioAvailable: healthData?.voiceStudioAvailable !== false,
+        audioExportAvailable: healthData?.audioExportAvailable !== false,
       };
     }
   } catch {
     // Service not reachable yet
   }
-  return { active: false, modelLoaded: false };
+  return {
+    active: false,
+    modelLoaded: false,
+    omrAvailable: false,
+    omrEngineStatus: 'backend_offline',
+    missingOmrDependencies: [],
+    pdfSupport: false,
+    musicXmlSupport: false,
+    voiceStudioAvailable: false,
+    audioExportAvailable: false,
+  };
+}
+
+async function ensurePythonServiceActive(): Promise<boolean> {
+  let health = await checkPythonServiceHealth();
+  if (health.active) return true;
+
+  if (!IS_LOCAL_PYTHON_BACKEND) {
+    // Remote Python server (e.g. Windows laptop tunnel) cannot be spawned locally
+    return false;
+  }
+
+  startPythonDaemon();
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await new Promise((r) => setTimeout(r, 400));
+    health = await checkPythonServiceHealth();
+    if (health.active) return true;
+  }
+  return false;
 }
 
 function startPythonDaemon(): void {
-  if (pythonDaemon || isBootstrappingPython) return;
+  if (!IS_LOCAL_PYTHON_BACKEND || pythonDaemon || isBootstrappingPython) return;
 
-  checkPythonServiceHealth().then(({ active }) => {
-    if (active || pythonDaemon || isBootstrappingPython) return;
+  let hasPy3 = false;
+  try {
+    const check = spawnSync('python3', ['--version'], { stdio: 'ignore' });
+    hasPy3 = check.status === 0;
+  } catch {
+    hasPy3 = false;
+  }
 
-    console.log('[ChoirMate Server] Starting Python Open-Weight FastAPI service on 127.0.0.1:5001...');
-    const proc = spawn(
-      'python3',
-      ['-m', 'uvicorn', 'python.service:app', '--host', '127.0.0.1', '--port', '5001'],
-      {
-        cwd: __dirname,
+  if (!hasPy3) {
+    console.warn('[ChoirMate Server] python3 not present in container environment.');
+    return;
+  }
+
+  const servicePy = path.join(rootDir, 'python', 'service.py');
+  if (!fs.existsSync(servicePy)) {
+    console.warn('[ChoirMate Server] python/service.py not found.');
+    return;
+  }
+
+  isBootstrappingPython = true;
+  checkPythonServiceHealth()
+    .then(({ active }) => {
+      isBootstrappingPython = false;
+      if (active || pythonDaemon) return;
+
+      let hasUvicorn = false;
+      try {
+        const uvCheck = spawnSync('python3', ['-c', 'import uvicorn, fastapi'], { stdio: 'ignore' });
+        hasUvicorn = uvCheck.status === 0;
+      } catch {
+        hasUvicorn = false;
+      }
+
+      const args = hasUvicorn
+        ? ['-m', 'uvicorn', 'python.service:app', '--host', '127.0.0.1', '--port', '5001']
+        : [servicePy];
+
+      console.log(
+        `[ChoirMate Server] Starting local Python music-processing service on 127.0.0.1:5001 (${hasUvicorn ? 'FastAPI/Uvicorn' : 'stdlib HTTP'})...`
+      );
+      const proc = spawn('python3', args, {
+        cwd: rootDir,
         stdio: ['ignore', 'pipe', 'pipe'],
-      }
-    );
+      });
 
-    pythonDaemon = proc;
-    let stderrBuf = '';
+      pythonDaemon = proc;
 
-    proc.stdout?.on('data', (chunk) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[Python Service] ${text}`);
+      proc.on('error', (err: any) => {
+        pythonDaemon = null;
+        console.warn('[ChoirMate Server] Python daemon startup error:', err.message);
+      });
+
+      proc.stdout?.on('data', (chunk) => {
+        const text = chunk.toString().trim();
+        if (text) console.log(`[Python Service] ${text}`);
+      });
+
+      proc.stderr?.on('data', (chunk) => {
+        const text = chunk.toString().trim();
+        if (text) console.error(`[Python Service] ${text}`);
+      });
+
+      proc.on('close', (code) => {
+        pythonDaemon = null;
+        console.log(`[ChoirMate Server] Python service closed (code ${code}).`);
+      });
+    })
+    .catch((err) => {
+      isBootstrappingPython = false;
+      console.warn('[ChoirMate Server] Python health check skipped:', err?.message);
     });
-
-    proc.stderr?.on('data', (chunk) => {
-      const text = chunk.toString();
-      stderrBuf += text;
-      if (text.trim()) console.error(`[Python Service] ${text.trim()}`);
-    });
-
-    proc.on('close', (code) => {
-      pythonDaemon = null;
-      if (
-        code !== 0 &&
-        (stderrBuf.includes('No module named') || stderrBuf.includes('ImportError')) &&
-        !isBootstrappingPython
-      ) {
-        isBootstrappingPython = true;
-        console.log('[ChoirMate Server] Bootstrapping missing Python OMR/SmolLM2/PDF dependencies...');
-        const bootstrapCmd = [
-          'python3 -m pip --version >/dev/null 2>&1 || (curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --no-cache-dir)',
-          'python3 -m pip install --no-cache-dir --root-user-action=ignore --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu homr==0.6.2 pypdfium2 fastapi uvicorn pydantic pillow scipy "opencv-python-headless<5.0" huggingface-hub llama-cpp-python requests',
-        ].join(' && ');
-
-        const bootProc = spawn('sh', ['-c', bootstrapCmd], {
-          cwd: __dirname,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        bootProc.on('close', (bootCode) => {
-          isBootstrappingPython = false;
-          console.log(`[ChoirMate Server] Python dependency bootstrap exited with code ${bootCode}`);
-          if (bootCode === 0) {
-            setTimeout(() => startPythonDaemon(), 1000);
-          }
-        });
-      }
-    });
-  });
 }
 
 function parseJsonFromStdout(stdoutData: string): any {
@@ -159,26 +297,58 @@ function parseJsonFromStdout(stdoutData: string): any {
 }
 
 app.get('/api/health', async (_req, res) => {
-  const { active: pythonServiceActive, modelLoaded } = await checkPythonServiceHealth();
-  if (!pythonServiceActive) {
-    startPythonDaemon();
+  let health = await checkPythonServiceHealth();
+  if (!health.active && IS_LOCAL_PYTHON_BACKEND) {
+    await ensurePythonServiceActive();
+    health = await checkPythonServiceHealth();
   }
 
   res.json({
     status: 'ok',
     openWeight: true,
-    pythonServiceActive,
-    modelLoaded,
-    pythonServiceUrl: PYTHON_SERVICE_URL,
-    pythonHost: '127.0.0.1',
+    pythonServiceActive: health.active,
+    pythonBackendMode: IS_LOCAL_PYTHON_BACKEND ? 'local' : 'remote',
+    modelLoaded: health.modelLoaded,
+    omrAvailable: health.omrAvailable,
+    omrEngineStatus: health.omrEngineStatus,
+    missingOmrDependencies: health.missingOmrDependencies,
+    pdfSupport: health.pdfSupport,
+    musicXmlSupport: health.musicXmlSupport,
+    voiceStudioAvailable: health.voiceStudioAvailable,
+    audioExportAvailable: health.audioExportAvailable,
+    pythonServiceUrl: IS_LOCAL_PYTHON_BACKEND ? PYTHON_SERVICE_URL : '[remote-configured]',
+    pythonHost: IS_LOCAL_PYTHON_BACKEND ? '127.0.0.1' : 'remote',
     pythonPort: 5001,
     recognitionEngine: 'HOMR (Full-Score Optical Music Recognition)',
-    pdfSupport: true,
     aiTeacher: 'SmolLM2-360M-Instruct-GGUF',
     modelLicense: 'Apache 2.0',
     sampleScoresCount: SAMPLE_SCORES.length,
   });
 });
+
+for (const endpoint of ['voices', 'audio'] as const) {
+  app.post(`/api/voice-studio/${endpoint}`, async (req, res) => {
+    try {
+      await ensurePythonServiceActive();
+      const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/voice-studio/${endpoint}`, {
+        method: 'POST',
+        headers: buildPythonHeaders(),
+        body: JSON.stringify(req.body),
+        signal: AbortSignal.timeout(120000),
+      });
+
+      const result = await pyResponse.json();
+      return res.status(pyResponse.status).json(result);
+    } catch (error) {
+      console.error('[Voice Studio] Request failed:', error);
+      return res.status(503).json({
+        success: false,
+        errorCode: 'VOICE_STUDIO_UNAVAILABLE',
+        error: 'Python Voice Studio service is currently unreachable. Please check backend health.',
+      });
+    }
+  });
+}
 
 app.post('/api/preview-pdf', async (req, res) => {
   try {
@@ -205,73 +375,43 @@ app.post('/api/preview-pdf', async (req, res) => {
       fileName: fileName || 'score.pdf',
     };
 
-    try {
-      const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/preview-pdf`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(60000),
-      });
+    await ensurePythonServiceActive();
 
-      const contentType = pyResponse.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const pyJson: any = await pyResponse.json();
-        if (pyResponse.ok && pyJson.success) {
-          pdfPreviewCache.set(cacheKey, pyJson);
-          return res.json(pyJson);
-        }
-        return res.status(422).json({
-          success: false,
-          errorCode: pyJson.errorCode || 'INVALID_PDF',
-          error: pyJson.error || 'Could not preview the uploaded PDF file.',
-        });
+    const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/preview-pdf`, {
+      method: 'POST',
+      headers: buildPythonHeaders(),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(60000),
+    });
+
+    const contentType = pyResponse.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const pyJson: any = await pyResponse.json();
+      if (pyResponse.status === 401 || pyResponse.status === 403) {
+        return res.status(pyResponse.status).json(pyJson);
       }
-    } catch (httpErr) {
-      console.warn(
-        '[ChoirMate Server] Python service unreachable for /preview-pdf, falling back to CLI:',
-        httpErr instanceof Error ? httpErr.message : httpErr
-      );
-      startPythonDaemon();
+      if (pyResponse.ok && pyJson.success) {
+        pdfPreviewCache.set(cacheKey, pyJson);
+        return res.json(pyJson);
+      }
+      return res.status(422).json({
+        success: false,
+        errorCode: pyJson?.errorCode || 'PDF_PREVIEW_FAILED',
+        error: pyJson?.error || FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+      });
     }
 
-    const pythonScript = path.resolve(__dirname, 'python', 'analyze.py');
-    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: __dirname });
-    let stdoutData = '';
-    let stderrData = '';
-    pythonProcess.stdout.on('data', (chunk) => {
-      stdoutData += chunk.toString();
+    return res.status(502).json({
+      success: false,
+      errorCode: 'PDF_PREVIEW_INVALID_RESPONSE',
+      error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
     });
-    pythonProcess.stderr.on('data', (chunk) => {
-      stderrData += chunk.toString();
-    });
-    pythonProcess.on('close', () => {
-      if (stderrData.trim()) {
-        console.error('[Python CLI preview-pdf stderr]:', stderrData.trim());
-      }
-      try {
-        const parsed = parseJsonFromStdout(stdoutData);
-        if (parsed.success) {
-          return res.json(parsed);
-        }
-        return res.status(422).json({
-          success: false,
-          errorCode: parsed.errorCode || 'INVALID_PDF',
-          error: parsed.error || 'Could not preview the uploaded PDF file.',
-        });
-      } catch {
-        return res.status(500).json({
-          success: false,
-          error: 'Failed to render PDF preview.',
-        });
-      }
-    });
-    pythonProcess.stdin.write(JSON.stringify(payload));
-    pythonProcess.stdin.end();
   } catch (err: any) {
     console.error('Server error in /api/preview-pdf:', err);
-    return res.status(500).json({
+    return res.status(503).json({
       success: false,
-      error: 'An unexpected error occurred while previewing the PDF document.',
+      errorCode: 'PDF_PREVIEW_UNAVAILABLE',
+      error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
     });
   }
 });
@@ -323,8 +463,8 @@ app.post('/api/analyze-sheet', async (req, res) => {
     }
 
     const payload = {
-      imageBase64: pageImages[0] || imageBase64,
-      pages: pageImages.length > 0 ? pageImages : undefined,
+      imageBase64: pageImages.length === 1 && !pdfBase64 ? pageImages[0] : undefined,
+      pages: pageImages.length > 1 && !pdfBase64 ? pageImages : undefined,
       pdfBase64: pdfBase64 || undefined,
       pdfFileName: pdfFileName || undefined,
       musicxml,
@@ -333,10 +473,12 @@ app.post('/api/analyze-sheet', async (req, res) => {
       tempo: tempo || 76,
     };
 
+    await ensurePythonServiceActive();
+
     try {
       const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildPythonHeaders(),
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(240000),
       });
@@ -344,6 +486,9 @@ app.post('/api/analyze-sheet', async (req, res) => {
       const contentType = pyResponse.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
         const pyJson: any = await pyResponse.json();
+        if (pyResponse.status === 401 || pyResponse.status === 403) {
+          return res.status(pyResponse.status).json(pyJson);
+        }
         if (pyResponse.ok && pyJson.success && pyJson.data) {
           if (!pyJson.data.pageImages && pageImages.length > 0) {
             pyJson.data.imageUrl = pageImages[0];
@@ -351,28 +496,37 @@ app.post('/api/analyze-sheet', async (req, res) => {
           }
           sheetAnalysisCache.set(cacheKey, pyJson);
           return res.json(pyJson);
-        } else if (pyJson && typeof pyJson.error === 'string') {
+        } else {
           return res.status(422).json({
             success: false,
-            errorCode: pyJson.errorCode || 'OMR_RECOGNITION_FAILED',
-            error: pyJson.error,
-            sectionDiagnostics: pyJson.sectionDiagnostics || [],
-            omrAttempted: true,
+            errorCode: pyJson?.errorCode || 'OMR_RECOGNITION_FAILED',
+            error:
+              pyJson?.error ||
+              (musicxml
+                ? 'Could not parse the uploaded MusicXML file.'
+                : FRIENDLY_HOMR_UNAVAILABLE_MESSAGE),
+            sectionDiagnostics: pyJson?.sectionDiagnostics || [],
+            omrAttempted: Boolean(pyJson?.omrAttempted),
             recognitionEngine: 'HOMR',
-            aiTeacher: 'SmolLM2-360M-Instruct-GGUF',
           });
         }
       }
     } catch (httpErr) {
+      if (!IS_LOCAL_PYTHON_BACKEND) {
+        return res.status(503).json({
+          success: false,
+          errorCode: 'HOMR_ENVIRONMENT_REQUIRED',
+          error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+        });
+      }
       console.warn(
-        '[ChoirMate Server] Python FastAPI service on port 5001 unreachable, falling back to python/analyze.py CLI:',
+        '[ChoirMate Server] Local Python service (127.0.0.1:5001) unreachable, falling back to local python/analyze.py CLI:',
         httpErr instanceof Error ? httpErr.message : httpErr
       );
-      startPythonDaemon();
     }
 
-    const pythonScript = path.resolve(__dirname, 'python', 'analyze.py');
-    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: __dirname });
+    const pythonScript = path.resolve(rootDir, 'python', 'analyze.py');
+    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: rootDir });
 
     let stdoutData = '';
     let stderrData = '';
@@ -385,7 +539,7 @@ app.post('/api/analyze-sheet', async (req, res) => {
       stderrData += chunk.toString();
     });
 
-    pythonProcess.on('close', (code) => {
+    pythonProcess.on('close', () => {
       if (stderrData.trim()) {
         console.error('[Python CLI stderr]:', stderrData.trim());
       }
@@ -393,10 +547,8 @@ app.post('/api/analyze-sheet', async (req, res) => {
       if (!stdoutData.trim()) {
         return res.status(503).json({
           success: false,
-          errorCode: 'ANALYSIS_ENGINE_UNAVAILABLE',
-          error: isBootstrappingPython
-            ? 'The Optical Music Recognition engine is finishing initial setup. Please try again in 20–30 seconds.'
-            : `Score analysis process exited unexpectedly (code ${code ?? 'unknown'}). Please verify the uploaded file is a valid PDF, PNG, or JPG of printed sheet music.`,
+          errorCode: 'HOMR_ENVIRONMENT_REQUIRED',
+          error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
         });
       }
 
@@ -407,27 +559,20 @@ app.post('/api/analyze-sheet', async (req, res) => {
             parsed.data.imageUrl = pageImages[0];
             parsed.data.pageImages = pageImages;
           }
+          sheetAnalysisCache.set(cacheKey, parsed);
           return res.json(parsed);
         } else {
-          const status = parsed.errorCode === 'PYTHON_DEPENDENCY_MISSING' ? 503 : 422;
-          return res.status(status).json({
+          return res.status(422).json({
             success: false,
             errorCode: parsed.errorCode || 'OMR_RECOGNITION_FAILED',
-            error:
-              parsed.error ||
-              'HOMR Optical Music Recognition could not detect clean musical staves from this document.',
-            sectionDiagnostics: parsed.sectionDiagnostics || [],
-            omrAttempted: true,
-            recognitionEngine: 'HOMR',
-            aiTeacher: 'SmolLM2-360M-Instruct-GGUF',
+            error: parsed.error || FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
           });
         }
       } catch (parseError) {
         console.error('Failed to parse Python pipeline JSON output:', stdoutData, parseError);
         return res.status(500).json({
           success: false,
-          errorCode: 'INVALID_ENGINE_OUTPUT',
-          error: 'The music analysis engine returned an unreadable response. Please try again.',
+          error: 'Failed to parse score recognition response.',
         });
       }
     });
@@ -439,6 +584,137 @@ app.post('/api/analyze-sheet', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: 'An unexpected error occurred while processing the score upload.',
+    });
+  }
+});
+
+const VALID_JOB_ID_REGEX = /^[A-Za-z0-9_-]{16,80}$/;
+
+app.post('/api/analyze-sheet/start', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  try {
+    const {
+      imageBase64,
+      pages,
+      pdfBase64,
+      pdfFileName,
+      musicxml,
+      title,
+      composer,
+      tempo,
+      simulatedDelaySeconds,
+    } = req.body || {};
+
+    const pageImages: string[] =
+      Array.isArray(pages) && pages.length > 0
+        ? pages
+        : imageBase64
+        ? [imageBase64]
+        : [];
+
+    if (pageImages.length === 0 && !pdfBase64 && !musicxml) {
+      return res.status(400).json({
+        success: false,
+        errorCode: 'NO_INPUT_PROVIDED',
+        error: 'Please provide a sheet music PDF document, page image(s), or a MusicXML file.',
+      });
+    }
+
+    await ensurePythonServiceActive();
+
+    const payload = {
+      imageBase64: pageImages.length === 1 && !pdfBase64 ? pageImages[0] : undefined,
+      pages: pageImages.length > 1 && !pdfBase64 ? pageImages : undefined,
+      pdfBase64: pdfBase64 || undefined,
+      pdfFileName: pdfFileName || undefined,
+      musicxml,
+      title: title || 'Analyzed Score',
+      composer: composer || 'Unknown Composer',
+      tempo: tempo || 76,
+      simulatedDelaySeconds:
+        typeof simulatedDelaySeconds === 'number' ? simulatedDelaySeconds : undefined,
+    };
+
+    const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/analyze/start`, {
+      method: 'POST',
+      headers: buildPythonHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(25000),
+    });
+
+    const pyJson: any = await pyResponse.json().catch(() => ({
+      success: false,
+      errorCode: 'INVALID_UPSTREAM_RESPONSE',
+      error: 'Python service returned an invalid response when starting the recognition job.',
+    }));
+
+    if (pyJson && typeof pyJson.data === 'object' && pyJson.data !== null) {
+      delete pyJson.data.pageImages;
+      delete pyJson.data.imageUrl;
+    }
+
+    return res.status(pyResponse.status).json(pyJson);
+  } catch (err: any) {
+    console.error('Server error in /api/analyze-sheet/start:', err?.message || err);
+    return res.status(503).json({
+      success: false,
+      errorCode: 'HOMR_ENVIRONMENT_REQUIRED',
+      error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+    });
+  }
+});
+
+app.get(['/api/analyze-sheet/status', '/api/analyze-sheet/status/:jobId'], async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  try {
+    const rawJobId = String(req.params.jobId || req.query.jobId || '').trim();
+    if (!VALID_JOB_ID_REGEX.test(rawJobId)) {
+      return res.status(400).json({
+        success: false,
+        status: 'failed',
+        errorCode: 'INVALID_JOB_ID',
+        error: 'Invalid or missing analysis jobId parameter.',
+      });
+    }
+
+    await ensurePythonServiceActive();
+
+    const pyResponse = await fetch(
+      `${PYTHON_SERVICE_URL}/analyze/status/${encodeURIComponent(rawJobId)}`,
+      {
+        method: 'GET',
+        headers: buildPythonHeaders(),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(15000),
+      }
+    );
+
+    const pyJson: any = await pyResponse.json().catch(() => ({
+      success: false,
+      status: 'failed',
+      errorCode: 'INVALID_UPSTREAM_RESPONSE',
+      error: 'Python service returned an invalid status payload.',
+    }));
+
+    if (pyJson && typeof pyJson.data === 'object' && pyJson.data !== null) {
+      delete pyJson.data.pageImages;
+      delete pyJson.data.imageUrl;
+    }
+
+    return res.status(pyResponse.status).json(pyJson);
+  } catch (err: any) {
+    console.error('Server error in /api/analyze-sheet/status:', err?.message || err);
+    return res.status(503).json({
+      success: false,
+      errorCode: 'HOMR_ENVIRONMENT_REQUIRED',
+      error: FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
     });
   }
 });
@@ -461,13 +737,20 @@ app.post('/api/recalculate-score', async (req, res) => {
       fifths,
     };
 
+    await ensurePythonServiceActive();
+
     try {
       const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/recalculate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildPythonHeaders(),
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(60000),
       });
+
+      if (pyResponse.status === 401 || pyResponse.status === 403) {
+        const authJson: any = await pyResponse.json().catch(() => ({}));
+        return res.status(pyResponse.status).json(authJson);
+      }
 
       if (pyResponse.ok) {
         const pyJson: any = await pyResponse.json();
@@ -482,6 +765,13 @@ app.post('/api/recalculate-score', async (req, res) => {
         });
       }
     } catch (httpErr) {
+      if (!IS_LOCAL_PYTHON_BACKEND) {
+        return res.status(503).json({
+          success: false,
+          errorCode: 'RECALCULATE_UNAVAILABLE',
+          error: 'Python score recalculation service is currently unreachable.',
+        });
+      }
       console.warn(
         '[ChoirMate Server] Python HTTP service unreachable for recalculate, falling back to CLI:',
         httpErr instanceof Error ? httpErr.message : httpErr
@@ -489,8 +779,8 @@ app.post('/api/recalculate-score', async (req, res) => {
       startPythonDaemon();
     }
 
-    const pythonScript = path.resolve(__dirname, 'python', 'analyze.py');
-    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: __dirname });
+    const pythonScript = path.resolve(rootDir, 'python', 'analyze.py');
+    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: rootDir });
     let stdoutData = '';
     let stderrData = '';
     pythonProcess.stdout.on('data', (chunk) => {
@@ -521,8 +811,8 @@ app.post('/api/recalculate-score', async (req, res) => {
         });
       }
     });
-      pythonProcess.stdin.write(JSON.stringify(payload));
-      pythonProcess.stdin.end();
+    pythonProcess.stdin.write(JSON.stringify(payload));
+    pythonProcess.stdin.end();
   } catch (err: any) {
     console.error('Server error in /api/recalculate-score:', err);
     return res.status(500).json({
@@ -582,13 +872,20 @@ app.post('/api/export-audio', async (req, res) => {
       return sendExportResult(cached);
     }
 
+    await ensurePythonServiceActive();
+
     try {
       const pyResponse = await fetch(`${PYTHON_SERVICE_URL}/export-audio`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildPythonHeaders(),
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(45000),
       });
+
+      if (pyResponse.status === 401 || pyResponse.status === 403) {
+        const authJson: any = await pyResponse.json().catch(() => ({}));
+        return res.status(pyResponse.status).json(authJson);
+      }
 
       if (pyResponse.ok) {
         const pyJson: any = await pyResponse.json();
@@ -603,6 +900,13 @@ app.post('/api/export-audio', async (req, res) => {
         });
       }
     } catch (httpErr) {
+      if (!IS_LOCAL_PYTHON_BACKEND) {
+        return res.status(503).json({
+          success: false,
+          errorCode: 'AUDIO_EXPORT_UNAVAILABLE',
+          error: 'Python audio export service is currently unreachable.',
+        });
+      }
       console.warn(
         '[ChoirMate Server] Python service unreachable for /export-audio, falling back to CLI:',
         httpErr instanceof Error ? httpErr.message : httpErr
@@ -610,8 +914,8 @@ app.post('/api/export-audio', async (req, res) => {
       startPythonDaemon();
     }
 
-    const pythonScript = path.resolve(__dirname, 'python', 'analyze.py');
-    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: __dirname });
+    const pythonScript = path.resolve(rootDir, 'python', 'analyze.py');
+    const pythonProcess = spawn('python3', [pythonScript, '-'], { cwd: rootDir });
     let stdoutData = '';
     let stderrData = '';
     pythonProcess.stdout.on('data', (chunk) => {
@@ -733,7 +1037,7 @@ async function askSmolLM2Teacher(payload: Record<string, any>): Promise<any> {
   try {
     const pyRes = await fetch(`${PYTHON_SERVICE_URL}/ask-teacher`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildPythonHeaders(),
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(30000),
     });
@@ -748,9 +1052,17 @@ async function askSmolLM2Teacher(payload: Record<string, any>): Promise<any> {
   }
 
   return new Promise((resolve, reject) => {
-    const pythonScript = path.resolve(__dirname, 'python', 'analyze.py');
-    const proc = spawn('python3', [pythonScript, '-'], { cwd: __dirname });
+    const pythonScript = path.resolve(rootDir, 'python', 'analyze.py');
+    const proc = spawn('python3', [pythonScript, '-'], { cwd: rootDir });
     let out = '';
+    proc.on('error', (err: any) => {
+      console.warn('[ChoirMate Server] python3 not available for askSmolLM2Teacher, returning fallback coaching:', err.message);
+      resolve({
+        answer: `As your choir vocal coach, I notice you asked about "${payload.question || 'this section'}". Remember to keep your soft palate lifted, maintain steady breath support from your diaphragm, and listen closely to your pitch center!`,
+        tips: ['Lift soft palate', 'Steady breath support', 'Match pitch accurately'],
+        solfaFocus: 'Do - Mi - Sol resonance',
+      });
+    });
     proc.stdout.on('data', (c) => (out += c.toString()));
     proc.on('close', () => {
       try {
@@ -866,26 +1178,99 @@ app.post('/api/voice-assistant/ask', async (req, res) => {
 });
 
 async function startServer() {
-  startPythonDaemon();
+  const isProd = process.env.NODE_ENV === 'production';
+  const distHtmlInRoot = path.join(rootDir, 'dist', 'index.html');
+  const distHtmlInCurrent =
+    path.resolve(__dirname) !== path.resolve(rootDir)
+      ? path.join(__dirname, 'index.html')
+      : '';
+  const distIndexHtml = fs.existsSync(distHtmlInRoot)
+    ? distHtmlInRoot
+    : distHtmlInCurrent && fs.existsSync(distHtmlInCurrent)
+    ? distHtmlInCurrent
+    : null;
+  const distDir = distIndexHtml ? path.dirname(distIndexHtml) : null;
 
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  let frontendMiddleware: any = null;
+
+  // Register dynamic frontend handler before app.listen so port 3000 can bind immediately
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+      return next();
+    }
+    if (frontendMiddleware) {
+      return frontendMiddleware(req, res, next);
+    }
+    if (distIndexHtml && distDir) {
+      return express.static(distDir)(req, res, () => {
+        res.sendFile(distIndexHtml);
+      });
+    }
+    next();
+  });
+
+  // Bind port 3000 immediately so health checks and preview readiness succeed without delay
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`ChoirMate AI open-weight server running on http://0.0.0.0:${PORT}`);
+    // Start local Python microservice asynchronously after HTTP server is already listening
+    setTimeout(() => {
+      startPythonDaemon();
+    }, 150);
+  });
+
+  if (isProd && distIndexHtml && distDir) {
+    console.log('[ChoirMate Server] Serving production static build from:', distDir);
+    const staticHandler = express.static(distDir);
+    frontendMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      staticHandler(req, res, () => {
+        if (req.path.startsWith('/api/')) return next();
+        res.sendFile(distIndexHtml);
+      });
+    };
   } else {
-    app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
-    });
+    try {
+      console.log('[ChoirMate Server] Mounting Vite development middleware...');
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        root: rootDir,
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      frontendMiddleware = vite.middlewares;
+      console.log('[ChoirMate Server] Vite development middleware ready.');
+    } catch (viteErr: any) {
+      console.warn('[ChoirMate Server] Vite middleware unavailable, falling back to static dist:', viteErr?.message);
+      if (distIndexHtml && distDir) {
+        const staticHandler = express.static(distDir);
+        frontendMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+          staticHandler(req, res, () => {
+            if (req.path.startsWith('/api/')) return next();
+            res.sendFile(distIndexHtml);
+          });
+        };
+      }
+    }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ChoirMate AI open-weight server running on http://0.0.0.0:${PORT}`);
-  });
+  const shutdown = (signal: string) => {
+    console.log(`[ChoirMate Server] Received ${signal}. Terminating services cleanly...`);
+    if (pythonDaemon) {
+      try {
+        pythonDaemon.kill('SIGTERM');
+      } catch {
+        // Process may already be closed
+      }
+    }
+    server.close(() => {
+      console.log('[ChoirMate Server] HTTP server closed.');
+      process.exit(0);
+    });
+    // Force exit after 5s if connections linger
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer();
-

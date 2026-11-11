@@ -5,24 +5,147 @@ Host: 127.0.0.1
 Port: 5001
 """
 
+import hmac
 import os
+import queue
+import re
+import secrets
 import sys
 import threading
+import time
 import traceback
-from typing import Optional, Dict, Any, List
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from typing import Optional, Dict, Any, List, Tuple
+
+
+def _load_local_env_files() -> None:
+    """
+    Loads .env.windows.local and .env from the repository root into os.environ
+    (without overwriting existing environment variables and without logging secrets).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for env_name in (".env.windows.local", ".env.local", ".env"):
+        env_path = os.path.join(repo_root, env_name)
+        if not os.path.isfile(env_path):
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+        except Exception:
+            pass
+
+
+_load_local_env_files()
+
+try:
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
+    from pydantic import BaseModel
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+    JSONResponse = None  # type: ignore
+    class FastAPI:  # type: ignore
+        def __init__(self, *args: Any, **kwargs: Any): pass
+        def get(self, *args: Any, **kwargs: Any): return lambda f: f
+        def post(self, *args: Any, **kwargs: Any): return lambda f: f
+        def add_middleware(self, *args: Any, **kwargs: Any): pass
+        def include_router(self, *args: Any, **kwargs: Any): pass
+    class CORSMiddleware: pass  # type: ignore
+    class BaseModel:  # type: ignore
+        def __init__(self, **kwargs: Any):
+            for k, v in getattr(self.__class__, "__dict__", {}).items():
+                if not k.startswith("_") and not callable(v):
+                    setattr(self, k, v)
+            for k, v in kwargs.items():
+                setattr(self, k, v)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from music_theory import parse_musicxml_string, recalculate_corrected_notes
 from smollm2_teacher import SmolLM2Teacher
-from omr_engine import recognize_score_pages
-from pdf_processor import decode_pdf_base64, render_pdf_document, MAX_PDF_PAGES
 from audio_exporter import export_practice_audio
+from voice_studio_api import (
+    router as voice_studio_router,
+    VoiceExtractionRequest,
+    VoiceAudioRequest,
+    get_voices,
+    generate_voice_audio,
+)
+
+try:
+    from omr_engine import recognize_score_pages
+    HAS_OMR = True
+except Exception as _omr_imp_err:
+    HAS_OMR = False
+    recognize_score_pages = None  # type: ignore
+
+try:
+    from pdf_processor import decode_pdf_base64, render_pdf_document, MAX_PDF_PAGES
+    HAS_PDF_PROCESSOR = True
+except Exception as _pdf_imp_err:
+    HAS_PDF_PROCESSOR = False
+    decode_pdf_base64 = None  # type: ignore
+    render_pdf_document = None  # type: ignore
+    MAX_PDF_PAGES = 12
+
+
+def _detect_missing_omr_dependencies() -> List[str]:
+    required = [
+        ("homr", "homr"),
+        ("cv2", "opencv-python-headless"),
+        ("PIL", "Pillow"),
+        ("numpy", "numpy"),
+        ("scipy", "scipy"),
+        ("pypdfium2", "pypdfium2"),
+        ("onnxruntime", "onnxruntime"),
+    ]
+    missing: List[str] = []
+    for mod_name, pkg_label in required:
+        try:
+            __import__(mod_name)
+        except Exception:
+            missing.append(pkg_label)
+    return missing
+
+
+MISSING_OMR_DEPENDENCIES = _detect_missing_omr_dependencies()
+PYTHON_HOST = os.environ.get("PYTHON_HOST", "127.0.0.1").strip() or "127.0.0.1"
+PYTHON_PORT = int(os.environ.get("PYTHON_PORT", "5001") or "5001")
+PYTHON_SERVICE_SECRET = (
+    os.environ.get("PYTHON_SERVICE_SECRET")
+    or os.environ.get("CHOIRMATE_BACKEND_SECRET")
+    or ""
+).strip()
+
+
+def _is_valid_secret(candidate: str) -> bool:
+    if not PYTHON_SERVICE_SECRET:
+        return True
+    if not candidate:
+        return False
+    return hmac.compare_digest(
+        candidate.encode("utf-8"),
+        PYTHON_SERVICE_SECRET.encode("utf-8"),
+    )
+
+
+FRIENDLY_HOMR_UNAVAILABLE_MESSAGE = (
+    "Sheet music image and PDF recognition is temporarily unavailable because the HOMR Optical Music "
+    "Recognition engine is currently offline. You can still upload MusicXML (.musicxml or .xml) files "
+    "for full note analysis, SATB voice extraction, and practice audio generation."
+)
 
 
 app = FastAPI(title="ChoirMate Open-Weight Full-Score Analysis Service")
+app.include_router(voice_studio_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,13 +154,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if HAS_FASTAPI and PYTHON_SERVICE_SECRET:
+    from fastapi import Request
+
+    @app.middleware("http")
+    async def verify_service_secret(request: Request, call_next: Any):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        header_secret = (
+            request.headers.get("x-choirmate-secret")
+            or request.headers.get("authorization", "").replace("Bearer ", "")
+        ).strip()
+        if not _is_valid_secret(header_secret):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "success": False,
+                    "errorCode": "UNAUTHORIZED_PYTHON_CLIENT",
+                    "error": "Unauthorized request to ChoirMate Python engine.",
+                },
+            )
+        return await call_next(request)
+
 # Initialize open-weight SmolLM2 teacher in memory
 teacher = SmolLM2Teacher()
 _SERVICE_LOCK = threading.Lock()
 
 
 class PdfPreviewRequest(BaseModel):
-    pdfBase64: str
+    pdfBase64: str = ""
     fileName: Optional[str] = "score.pdf"
 
 
@@ -51,17 +196,18 @@ class AnalyzeRequest(BaseModel):
     title: Optional[str] = "Analyzed Score"
     composer: Optional[str] = "Unknown Composer"
     tempo: Optional[int] = 76
+    simulatedDelaySeconds: Optional[float] = None
 
 
 class RecalculateRequest(BaseModel):
-    score: Dict[str, Any]
+    score: Dict[str, Any] = {}
     partId: Optional[str] = None
-    updatedNotes: List[Dict[str, Any]]
+    updatedNotes: List[Dict[str, Any]] = []
     fifths: Optional[int] = None
 
 
 class ExportAudioRequest(BaseModel):
-    notes: List[Dict[str, Any]]
+    notes: List[Dict[str, Any]] = []
     title: Optional[str] = "Practice Score"
     partName: Optional[str] = "Vocal Part"
     scopeLabel: Optional[str] = "Full Song"
@@ -72,7 +218,7 @@ class ExportAudioRequest(BaseModel):
 
 
 class AskTeacherRequest(BaseModel):
-    question: str
+    question: str = ""
     title: Optional[str] = "Active Score"
     partName: Optional[str] = "Vocal Part"
     keySignature: Optional[Dict[str, Any]] = None
@@ -80,20 +226,26 @@ class AskTeacherRequest(BaseModel):
     notes: Optional[List[Dict[str, Any]]] = None
 
 
-
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "ChoirMate Open-Weight Python Service",
-        "host": "127.0.0.1",
-        "port": 5001,
+        "host": PYTHON_HOST,
+        "port": PYTHON_PORT,
+        "authRequired": bool(PYTHON_SERVICE_SECRET),
         "recognitionEngine": "HOMR (Full-Score Optical Music Recognition)",
-        "pdfSupport": True,
+        "omrAvailable": HAS_OMR,
+        "omrEngineStatus": "ready" if HAS_OMR else "unavailable_in_environment",
+        "missingOmrDependencies": [] if HAS_OMR else MISSING_OMR_DEPENDENCIES,
+        "pdfSupport": HAS_PDF_PROCESSOR,
+        "musicXmlSupport": True,
+        "voiceStudioAvailable": True,
+        "audioExportAvailable": True,
         "maxPdfPages": MAX_PDF_PAGES,
         "aiTeacher": "SmolLM2-360M-Instruct-GGUF",
         "modelLoaded": teacher.llm is not None,
-        "modelLicense": "Apache 2.0"
+        "modelLicense": "Apache 2.0",
     }
 
 
@@ -103,6 +255,12 @@ def preview_pdf(req: PdfPreviewRequest):
     Validates an uploaded PDF and renders lightweight page thumbnails and display images
     so the user can preview page count and thumbnails before running full OMR analysis.
     """
+    if not HAS_PDF_PROCESSOR or decode_pdf_base64 is None or render_pdf_document is None:
+        return {
+            "success": False,
+            "errorCode": "PDF_PROCESSOR_UNAVAILABLE",
+            "error": FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+        }
     try:
         pdf_bytes = decode_pdf_base64(req.pdfBase64)
         rendered = render_pdf_document(pdf_bytes, preview_only=True)
@@ -249,6 +407,12 @@ def analyze(req: AnalyzeRequest):
             total_doc_pages = 0
 
             if req.pdfBase64:
+                if not HAS_PDF_PROCESSOR or decode_pdf_base64 is None or render_pdf_document is None:
+                    return {
+                        "success": False,
+                        "errorCode": "HOMR_ENVIRONMENT_REQUIRED",
+                        "error": FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+                    }
                 try:
                     pdf_bytes = decode_pdf_base64(req.pdfBase64)
                     rendered = render_pdf_document(pdf_bytes, preview_only=False)
@@ -278,9 +442,14 @@ def analyze(req: AnalyzeRequest):
                         page_numbers.append(p["pageNumber"])
 
             elif req.pages and len(req.pages) > 0:
-                # Check if a single base64 PDF was passed inside pages[0]
                 first_item = req.pages[0]
                 if isinstance(first_item, str) and first_item.startswith("data:application/pdf"):
+                    if not HAS_PDF_PROCESSOR or decode_pdf_base64 is None or render_pdf_document is None:
+                        return {
+                            "success": False,
+                            "errorCode": "HOMR_ENVIRONMENT_REQUIRED",
+                            "error": FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+                        }
                     try:
                         pdf_bytes = decode_pdf_base64(first_item)
                         rendered = render_pdf_document(pdf_bytes, preview_only=False)
@@ -305,6 +474,12 @@ def analyze(req: AnalyzeRequest):
                     total_doc_pages = len(req.pages)
             elif req.imageBase64:
                 if req.imageBase64.startswith("data:application/pdf"):
+                    if not HAS_PDF_PROCESSOR or decode_pdf_base64 is None or render_pdf_document is None:
+                        return {
+                            "success": False,
+                            "errorCode": "HOMR_ENVIRONMENT_REQUIRED",
+                            "error": FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+                        }
                     try:
                         pdf_bytes = decode_pdf_base64(req.imageBase64)
                         rendered = render_pdf_document(pdf_bytes, preview_only=False)
@@ -329,6 +504,14 @@ def analyze(req: AnalyzeRequest):
                     total_doc_pages = 1
 
             if page_inputs:
+                if not HAS_OMR or recognize_score_pages is None:
+                    return {
+                        "success": False,
+                        "errorCode": "HOMR_ENVIRONMENT_REQUIRED",
+                        "error": FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+                        "omrAttempted": False,
+                        "recognitionEngine": "HOMR",
+                    }
                 omr_res = recognize_score_pages(
                     page_inputs,
                     title=req.title or "Recognized Score",
@@ -416,6 +599,314 @@ def analyze(req: AnalyzeRequest):
                 "error": "Could not complete score recognition on the uploaded file. Please verify the file is a clear PDF, PNG, or JPG of printed sheet music."
             }
 
+
+# ---------------------------------------------------------------------------
+# Asynchronous HOMR Job Manager (In-Memory, Single Worker, Bounded Queue)
+#
+# NOTE: Jobs and completed results are stored in process memory only and will
+# be cleared if the Python service restarts. Completed and failed jobs remain
+# retrievable for up to JOB_RETENTION_SECONDS (15 minutes) and are never
+# deleted immediately on the first status poll.
+# ---------------------------------------------------------------------------
+
+_JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
+MAX_QUEUED_JOBS = 8
+MAX_STORED_COMPLETED_JOBS = 20
+JOB_RETENTION_SECONDS = 900.0  # 15 minutes
+
+_JOBS_LOCK = threading.Lock()
+_JOBS: Dict[str, Dict[str, Any]] = {}
+_JOB_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=MAX_QUEUED_JOBS)
+_WORKER_THREAD: Optional[threading.Thread] = None
+
+
+def _prune_expired_jobs_locked(now: float) -> None:
+    """
+    Removes terminal (completed/failed) jobs older than JOB_RETENTION_SECONDS
+    and enforces MAX_STORED_COMPLETED_JOBS by evicting the oldest finished jobs.
+    Must be called while holding _JOBS_LOCK.
+    """
+    terminal_ids: List[Tuple[float, str]] = []
+    for jid, rec in list(_JOBS.items()):
+        st = rec.get("status")
+        if st in ("completed", "failed"):
+            finished_at = float(rec.get("finishedAt") or rec.get("updatedAt") or rec.get("createdAt") or now)
+            if now - finished_at > JOB_RETENTION_SECONDS:
+                _JOBS.pop(jid, None)
+            else:
+                terminal_ids.append((finished_at, jid))
+
+    if len(terminal_ids) > MAX_STORED_COMPLETED_JOBS:
+        terminal_ids.sort(key=lambda item: item[0])
+        excess = len(terminal_ids) - MAX_STORED_COMPLETED_JOBS
+        for _, oldest_jid in terminal_ids[:excess]:
+            _JOBS.pop(oldest_jid, None)
+
+
+def _analysis_worker_loop() -> None:
+    """
+    Single background worker thread that processes queued HOMR analysis jobs
+    sequentially. Any failure in one job is caught and recorded on that job
+    so the worker always continues to the next queued job.
+    """
+    while True:
+        job_id = _JOB_QUEUE.get()
+        try:
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+                if not job:
+                    continue
+                req: Optional[AnalyzeRequest] = job.get("request")
+                now = time.time()
+                job["status"] = "processing"
+                job["startedAt"] = now
+                job["updatedAt"] = now
+
+            if req is None:
+                with _JOBS_LOCK:
+                    if job_id in _JOBS:
+                        _JOBS[job_id]["status"] = "failed"
+                        _JOBS[job_id]["finishedAt"] = time.time()
+                        _JOBS[job_id]["updatedAt"] = time.time()
+                        _JOBS[job_id]["result"] = {
+                            "success": False,
+                            "errorCode": "NO_INPUT_PROVIDED",
+                            "error": "Job request payload was empty.",
+                        }
+                continue
+
+            # Optional test hook to verify >55s long-running job polling
+            sim_delay = getattr(req, "simulatedDelaySeconds", None)
+            if sim_delay is not None:
+                try:
+                    delay_val = min(max(float(sim_delay), 0.0), 120.0)
+                    if delay_val > 0:
+                        time.sleep(delay_val)
+                except Exception:
+                    pass
+
+            analysis_res = analyze(req)
+            finished_ts = time.time()
+
+            with _JOBS_LOCK:
+                job_rec = _JOBS.get(job_id)
+                if job_rec is not None:
+                    job_rec["request"] = None  # Free input base64 memory
+                    job_rec["finishedAt"] = finished_ts
+                    job_rec["updatedAt"] = finished_ts
+                    if analysis_res.get("success") and analysis_res.get("data"):
+                        job_rec["status"] = "completed"
+                        job_rec["result"] = analysis_res
+                    else:
+                        job_rec["status"] = "failed"
+                        job_rec["result"] = analysis_res
+                _prune_expired_jobs_locked(finished_ts)
+
+        except Exception as worker_err:
+            sys.stderr.write(f"[Python Service] Async worker error on job {job_id}: {worker_err}\n")
+            traceback.print_exc(file=sys.stderr)
+            with _JOBS_LOCK:
+                job_rec = _JOBS.get(job_id)
+                if job_rec is not None:
+                    job_rec["request"] = None
+                    job_rec["status"] = "failed"
+                    job_rec["finishedAt"] = time.time()
+                    job_rec["updatedAt"] = time.time()
+                    job_rec["result"] = {
+                        "success": False,
+                        "errorCode": "INTERNAL_ANALYSIS_ERROR",
+                        "error": "Could not complete score recognition on the uploaded file.",
+                    }
+        finally:
+            _JOB_QUEUE.task_done()
+
+
+def _ensure_worker_started_locked() -> None:
+    """Starts the single background worker thread if not already alive. Must hold _JOBS_LOCK."""
+    global _WORKER_THREAD
+    if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():
+        _WORKER_THREAD = threading.Thread(
+            target=_analysis_worker_loop,
+            name="choirmate-homr-worker",
+            daemon=True,
+        )
+        _WORKER_THREAD.start()
+
+
+def start_analyze_job(req: AnalyzeRequest) -> Tuple[int, Dict[str, Any]]:
+    """
+    Enqueues a score analysis request without waiting for HOMR recognition or _SERVICE_LOCK.
+    Returns (http_status_code, response_dict).
+    """
+    has_pages = bool(req.pages and len(req.pages) > 0)
+    if not req.musicxml and not req.pdfBase64 and not req.imageBase64 and not has_pages:
+        return (
+            400,
+            {
+                "success": False,
+                "errorCode": "NO_INPUT_PROVIDED",
+                "error": "Please provide a sheet music PDF document, page image(s), or a MusicXML file.",
+            },
+        )
+
+    now = time.time()
+    job_id = secrets.token_urlsafe(24)
+
+    with _JOBS_LOCK:
+        _prune_expired_jobs_locked(now)
+        _ensure_worker_started_locked()
+
+        active_count = sum(1 for r in _JOBS.values() if r.get("status") in ("queued", "processing"))
+        if _JOB_QUEUE.full() or active_count >= (MAX_QUEUED_JOBS + 1):
+            return (
+                429,
+                {
+                    "success": False,
+                    "errorCode": "ANALYSIS_QUEUE_FULL",
+                    "error": "The score recognition queue is currently full. Please wait for the current score analysis to finish and try again.",
+                },
+            )
+
+        is_worker_busy = any(r.get("status") == "processing" for r in _JOBS.values()) or not _JOB_QUEUE.empty()
+        _JOBS[job_id] = {
+            "jobId": job_id,
+            "status": "queued",
+            "createdAt": now,
+            "startedAt": None,
+            "finishedAt": None,
+            "updatedAt": now,
+            "request": req,
+            "result": None,
+        }
+        try:
+            _JOB_QUEUE.put_nowait(job_id)
+        except queue.Full:
+            _JOBS.pop(job_id, None)
+            return (
+                429,
+                {
+                    "success": False,
+                    "errorCode": "ANALYSIS_QUEUE_FULL",
+                    "error": "The score recognition queue is currently full. Please wait a moment and try again.",
+                },
+            )
+
+    return (
+        202,
+        {
+            "success": True,
+            "jobId": job_id,
+            "status": "queued",
+            "workerBusy": is_worker_busy,
+            "message": (
+                "Score queued behind active recognition job..."
+                if is_worker_busy
+                else "Score submitted to HOMR recognition engine..."
+            ),
+        },
+    )
+
+
+def get_analyze_job_status(job_id: str) -> Tuple[int, Dict[str, Any]]:
+    """
+    Retrieves the current status or final result of an asynchronous analysis job.
+    Does not delete completed results on read; jobs expire after JOB_RETENTION_SECONDS.
+    """
+    clean_id = (job_id or "").strip()
+    if not _JOB_ID_PATTERN.match(clean_id):
+        return (
+            400,
+            {
+                "success": False,
+                "status": "failed",
+                "errorCode": "INVALID_JOB_ID",
+                "error": "Invalid analysis job identifier.",
+            },
+        )
+
+    now = time.time()
+    with _JOBS_LOCK:
+        _prune_expired_jobs_locked(now)
+        job = _JOBS.get(clean_id)
+        if job is None:
+            return (
+                404,
+                {
+                    "success": False,
+                    "status": "failed",
+                    "errorCode": "JOB_NOT_FOUND",
+                    "error": (
+                        "Recognition job was not found or expired (in-memory jobs are cleared if the Python "
+                        "service restarts). Please start the analysis again."
+                    ),
+                },
+            )
+
+        status = job["status"]
+        created_at = float(job.get("createdAt") or now)
+        elapsed = round(max(0.0, now - created_at), 1)
+        result = job.get("result")
+
+    if status in ("queued", "processing"):
+        return (
+            200,
+            {
+                "success": True,
+                "jobId": clean_id,
+                "status": status,
+                "elapsedSeconds": elapsed,
+                "message": (
+                    "Running HOMR Optical Music Recognition & music theory analysis..."
+                    if status == "processing"
+                    else "Queued for HOMR Optical Music Recognition..."
+                ),
+            },
+        )
+
+    if status == "completed" and isinstance(result, dict) and result.get("data"):
+        return (
+            200,
+            {
+                "success": True,
+                "jobId": clean_id,
+                "status": "completed",
+                "elapsedSeconds": elapsed,
+                "data": result["data"],
+                "source": result.get("source"),
+            },
+        )
+
+    err_dict = result if isinstance(result, dict) else {}
+    return (
+        200,
+        {
+            "success": False,
+            "jobId": clean_id,
+            "status": "failed",
+            "elapsedSeconds": elapsed,
+            "errorCode": err_dict.get("errorCode") or "OMR_RECOGNITION_FAILED",
+            "error": err_dict.get("error") or FRIENDLY_HOMR_UNAVAILABLE_MESSAGE,
+            "sectionDiagnostics": err_dict.get("sectionDiagnostics") or [],
+            "omrAttempted": bool(err_dict.get("omrAttempted")),
+            "recognitionEngine": err_dict.get("recognitionEngine") or "HOMR",
+        },
+    )
+
+
+@app.post("/analyze/start")
+def analyze_start_endpoint(req: AnalyzeRequest):
+    status_code, payload = start_analyze_job(req)
+    if HAS_FASTAPI and JSONResponse is not None:
+        return JSONResponse(status_code=status_code, content=payload)
+    return payload
+
+
+@app.get("/analyze/status/{job_id}")
+def analyze_status_endpoint(job_id: str):
+    status_code, payload = get_analyze_job_status(job_id)
+    if HAS_FASTAPI and JSONResponse is not None:
+        return JSONResponse(status_code=status_code, content=payload)
+    return payload
 
 
 @app.post("/recalculate")
@@ -518,3 +1009,121 @@ def ask_teacher_endpoint(req: AskTeacherRequest):
             "error": "Could not generate a coaching response right now. Please try again.",
         }
 
+
+if __name__ == "__main__":
+    try:
+        import uvicorn
+        if not HAS_FASTAPI:
+            raise ImportError("FastAPI not installed")
+        uvicorn.run(app, host=PYTHON_HOST, port=PYTHON_PORT)
+    except ImportError:
+        import json
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+        class ChoirMateFallbackHTTPHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+            def _check_auth(self) -> bool:
+                if not PYTHON_SERVICE_SECRET:
+                    return True
+                header_secret = (
+                    self.headers.get("X-ChoirMate-Secret")
+                    or self.headers.get("x-choirmate-secret")
+                    or (self.headers.get("Authorization") or "").replace("Bearer ", "")
+                ).strip()
+                if not _is_valid_secret(header_secret):
+                    self._send_json(
+                        401,
+                        {
+                            "success": False,
+                            "errorCode": "UNAUTHORIZED_PYTHON_CLIENT",
+                            "error": "Unauthorized request to ChoirMate Python engine.",
+                        },
+                    )
+                    return False
+                return True
+
+            def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_OPTIONS(self) -> None:
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-ChoirMate-Secret")
+                self.end_headers()
+
+            def do_GET(self) -> None:
+                if not self._check_auth():
+                    return
+                clean_path = self.path.split("?", 1)[0]
+                if clean_path == "/health":
+                    self._send_json(200, health())
+                elif clean_path.startswith("/analyze/status/"):
+                    job_id = clean_path[len("/analyze/status/"):]
+                    status_code, payload = get_analyze_job_status(job_id)
+                    self._send_json(status_code, payload)
+                else:
+                    self._send_json(404, {"success": False, "error": f"Unknown GET endpoint: {clean_path}"})
+
+            def do_POST(self) -> None:
+                if not self._check_auth():
+                    return
+                clean_path = self.path.split("?", 1)[0]
+                if clean_path == "/health":
+                    self._send_json(200, health())
+                    return
+
+                content_length = int(self.headers.get("Content-Length") or 0)
+                raw_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+                try:
+                    data = json.loads(raw_body) if raw_body.strip() else {}
+                except Exception as exc:
+                    self._send_json(400, {"success": False, "error": f"Invalid JSON payload: {exc}"})
+                    return
+
+                try:
+                    if clean_path == "/preview-pdf":
+                        res = preview_pdf(PdfPreviewRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/analyze/start":
+                        status_code, payload = start_analyze_job(AnalyzeRequest(**data))
+                        self._send_json(status_code, payload)
+                    elif clean_path == "/analyze":
+                        res = analyze(AnalyzeRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/recalculate":
+                        res = recalculate(RecalculateRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/export-audio":
+                        res = export_audio_endpoint(ExportAudioRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/ask-teacher":
+                        res = ask_teacher_endpoint(AskTeacherRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/voice-studio/voices":
+                        res = get_voices(VoiceExtractionRequest(**data))
+                        self._send_json(200, res)
+                    elif clean_path == "/voice-studio/audio":
+                        res = generate_voice_audio(VoiceAudioRequest(**data))
+                        self._send_json(200, res)
+                    else:
+                        self._send_json(404, {"success": False, "error": f"Unknown POST endpoint: {clean_path}"})
+                except Exception as err:
+                    sys.stderr.write(f"[Python Fallback HTTP] Error on {clean_path}: {err}\n")
+                    traceback.print_exc(file=sys.stderr)
+                    self._send_json(500, {"success": False, "error": str(err)})
+
+        server = ThreadingHTTPServer((PYTHON_HOST, PYTHON_PORT), ChoirMateFallbackHTTPHandler)
+        print(f"[Python Service] Running ChoirMate Python HTTP service on {PYTHON_HOST}:{PYTHON_PORT}", flush=True)
+        server.serve_forever()
